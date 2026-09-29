@@ -19,7 +19,7 @@ jobs:
       - run: cp main.dart gfl_app/lib/main.dart
       - working-directory: gfl_app
         run: |
-          flutter pub add http html shared_preferences
+          flutter pub add http html shared_preferences url_launcher
           sed -i 's|<application|<uses-permission android:name="android.permission.INTERNET"/>\n    <application|' android/app/src/main/AndroidManifest.xml
           flutter build apk --release
       - uses: actions/upload-artifact@v4
