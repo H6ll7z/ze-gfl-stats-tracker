@@ -1,10 +1,9 @@
-// GFL Zombie Escape Stats
-// Pulls your stats from stats.gflclan.com (HLstatsX) using your Steam ID.
+// GFL Zombie Escape Stats v2
+// Reads your stats from ZE Graph (zegraph.xyz) using your Steam ID.
 //
 // pubspec.yaml dependencies needed:
-//   http: ^1.2.0
-//   html: ^0.15.4
-//   shared_preferences: ^2.2.0
+//   http, html, shared_preferences, url_launcher
+//   (run: flutter pub add http html shared_preferences url_launcher)
 //
 // Android release builds need this in android/app/src/main/AndroidManifest.xml
 // (above <application>):
@@ -16,8 +15,9 @@ import 'package:http/http.dart' as http;
 import 'package:html/parser.dart' as html_parser;
 import 'package:html/dom.dart' as dom;
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:url_launcher/url_launcher.dart';
 
-const String kBase = 'https://stats.gflclan.com/hlstats.php';
+const String kSite = 'https://zegraph.xyz';
 const Color kGreen = Color(0xFF00FF66);
 const Color kDim = Color(0xFF148A45);
 const Color kYellow = Color(0xFFFFE600);
@@ -32,73 +32,70 @@ void main() {
 
 // ---------------------------------------------------------------- data ----
 
-class TableData {
-  final List<String> header;
-  final List<List<String>> rows;
-  TableData(this.header, this.rows);
-
-  String col(List<String> row, String key) {
-    final i = header.indexWhere((h) => h.toLowerCase().contains(key));
-    if (i < 0 || i >= row.length) return '-';
-    return row[i];
-  }
+class Community {
+  final String name;
+  final String hours;
+  Community(this.name, this.hours);
 }
 
 class PlayerStats {
   final String name;
+  final String id64;
   final String url;
-  final Map<String, String> summary;
-  final TableData? weapons;
-  final TableData? maps;
-  final TableData? actions;
-  PlayerStats(this.name, this.url, this.summary, this.weapons, this.maps,
-      this.actions);
+  final String hours;
+  final String servers;
+  final String communityCount;
+  final String rank;
+  final String totalPlayers;
+  final String bestMapRank;
+  final String bestMap;
+  final String lastSeen;
+  final String yearHours;
+  final String year;
+  final List<Community> communities;
 
-  String s(String label) => summary[label] ?? '-';
-
-  /// Sum of "Earned" for actions that look like round wins / escapes.
-  int? get roundsWon {
-    if (actions == null) return null;
-    int total = 0;
-    bool found = false;
-    for (final r in actions!.rows) {
-      final n = actions!.col(r, 'action').toLowerCase();
-      if (n.contains('win') || n.contains('escape') || n.contains('round')) {
-        found = true;
-        total += num_(actions!.col(r, 'earned')).toInt();
-      }
-    }
-    return found ? total : null;
-  }
+  PlayerStats({
+    required this.name,
+    required this.id64,
+    required this.url,
+    required this.hours,
+    required this.servers,
+    required this.communityCount,
+    required this.rank,
+    required this.totalPlayers,
+    required this.bestMapRank,
+    required this.bestMap,
+    required this.lastSeen,
+    required this.yearHours,
+    required this.year,
+    required this.communities,
+  });
 }
 
-double num_(String s) =>
-    double.tryParse(s.replaceAll(',', '').replaceAll(RegExp(r'[^0-9.\-]'), '')) ??
-    0;
+class NotTrackedException implements Exception {
+  @override
+  String toString() =>
+      'No stats found for this Steam ID. ZE Graph only lists players it has '
+      'seen on a tracked server. Play on the GFL CS2 server and try again later.';
+}
 
 String clean(String s) => s.replaceAll(RegExp(r'\s+'), ' ').trim();
-
-// Strip trailing "(0*)" style bits and stray separators.
-String cleanVal(String s) {
-  var v = s.split(' (').first.replaceAll('·', '').trim();
-  return v.isEmpty ? '-' : v;
-}
 
 // ------------------------------------------------------------ steam id ----
 
 /// Accepts SteamID64, STEAM_0:X:Y, or a steamcommunity.com/profiles/<id64> URL.
-/// Returns "STEAM_0:X:Y". Vanity URLs (/id/name) can't be resolved without a
-/// Steam API key, so those throw.
-String toSteam2(String input) {
+/// Returns the SteamID64 as a string. Vanity URLs (/id/name) can't be
+/// resolved without a Steam API key, so those throw.
+String toSteam64(String input) {
   final t = input.trim();
-  final m2 = RegExp(r'STEAM_[0-5]:([01]):(\d+)', caseSensitive: false)
-      .firstMatch(t);
-  if (m2 != null) return 'STEAM_0:${m2.group(1)}:${m2.group(2)}';
   final m64 = RegExp(r'7656119\d{10}').firstMatch(t);
-  if (m64 != null) {
-    final id64 = int.parse(m64.group(0)!);
-    final acc = id64 - 76561197960265728;
-    return 'STEAM_0:${acc % 2}:${acc ~/ 2}';
+  if (m64 != null) return m64.group(0)!;
+  final m2 =
+      RegExp(r'STEAM_[0-5]:([01]):(\d+)', caseSensitive: false).firstMatch(t);
+  if (m2 != null) {
+    final y = int.parse(m2.group(1)!);
+    final z = int.parse(m2.group(2)!);
+    return (76561197960265728 + z * 2 + y).toString();
   }
   throw Exception(
       'Use your SteamID64 (17 digits), STEAM_0:X:Y, or a /profiles/ URL.');
@@ -106,118 +103,96 @@ String toSteam2(String input) {
 
 // -------------------------------------------------------------- scraping ----
 
-List<dom.Element> ownRows(dom.Element table) =>
-    table.querySelectorAll('tr').where((tr) {
-      dom.Element? p = tr.parent;
-      while (p != null && p.localName != 'table') {
-        p = p.parent;
-      }
-      return identical(p, table);
-    }).toList();
-
-List<String> cellsOf(dom.Element tr) => tr
-    .children
-    .where((c) => c.localName == 'td' || c.localName == 'th')
-    .map((c) => clean(c.text))
-    .toList();
-
-TableData? findTable(dom.Document doc, String kind) {
-  for (final table in doc.querySelectorAll('table')) {
-    final rows = ownRows(table);
-    List<String>? header;
-    final data = <List<String>>[];
-    for (final tr in rows) {
-      final cells = cellsOf(tr);
-      if (cells.isEmpty) continue;
-      if (header == null) {
-        if (cells.first.toLowerCase().startsWith('rank') &&
-            cells.length < 20 &&
-            cells.any((c) => c.toLowerCase().startsWith(kind))) {
-          header = cells;
-        }
-      } else if (cells.length >= 3 && int.tryParse(cells.first) != null) {
-        data.add(cells);
-      }
+List<Community> readCommunities(dom.Document doc) {
+  final out = <Community>[];
+  final hrs = RegExp(r'([\d,]+\.?\d*)\s*hrs');
+  for (final h in doc.querySelectorAll('h3')) {
+    final name = clean(h.text);
+    if (name.isEmpty) continue;
+    var txt = '';
+    dom.Element? sib = h.nextElementSibling;
+    while (sib != null && sib.localName != 'h3') {
+      txt += ' ${sib.text}';
+      sib = sib.nextElementSibling;
     }
-    if (header != null && data.isNotEmpty) return TableData(header, data);
-  }
-  return null;
-}
-
-Map<String, String> readSummary(dom.Document doc) {
-  final out = <String, String>{};
-  for (final tr in doc.querySelectorAll('tr')) {
-    if (tr.querySelector('table') != null) continue;
-    final cells = cellsOf(tr).where((c) => c.isNotEmpty && c != '·').toList();
-    if (cells.length >= 2 && cells[0].endsWith(':')) {
-      out.putIfAbsent(cells[0], () => cleanVal(cells[1]));
+    var m = hrs.firstMatch(txt);
+    final parent = h.parent;
+    if (m == null && parent != null && parent.querySelectorAll('h3').length == 1) {
+      m = hrs.firstMatch(parent.text.replaceFirst(h.text, ''));
     }
+    if (m != null) out.add(Community(name, m.group(1)!));
   }
   return out;
 }
 
-Future<http.Response> _get(Uri u) => http.get(u, headers: {
-      'User-Agent': 'Mozilla/5.0 (Android) GFLZEStats/1.0',
-    }).timeout(const Duration(seconds: 20));
+PlayerStats parseProfile(String body, String id64, String url) {
+  final doc = html_parser.parse(body);
 
-Future<PlayerStats> fetchStats(String input) async {
-  final steam2 = toSteam2(input);
-  final uniq = steam2.substring('STEAM_0:'.length); // "X:Y"
+  String meta(String key) =>
+      doc.querySelector('meta[name="$key"]')?.attributes['content'] ??
+      doc.querySelector('meta[property="og:$key"]')?.attributes['content'] ??
+      '';
 
-  final searchUri =
-      Uri.parse('$kBase?mode=search&q=$uniq&st=uniqueid&game=');
-  var res = await _get(searchUri);
-  var url = res.request?.url ?? searchUri;
-  var doc = html_parser.parse(res.body);
+  final desc = meta('description');
+  final hm = RegExp(
+          r'([\d,\.]+) hrs of Zombie Escape playtime across (\d+) servers? in (\d+) communit')
+      .firstMatch(desc);
+  if (hm == null) throw NotTrackedException();
 
-  // Follow a meta-refresh redirect if the site uses one.
-  final meta = doc.querySelector('meta[http-equiv="refresh"]');
-  if (meta != null) {
-    final m = RegExp(r'url=(.+)', caseSensitive: false)
-        .firstMatch(meta.attributes['content'] ?? '');
-    if (m != null) {
-      url = url.resolve(m.group(1)!.trim());
-      res = await _get(url);
-      doc = html_parser.parse(res.body);
-    }
-  }
-
-  // Not on a player page yet -> pick a result link (prefer Zombie Escape).
-  if (!url.toString().contains('mode=playerinfo')) {
-    final links = doc.querySelectorAll('a').where(
-        (a) => (a.attributes['href'] ?? '').contains('mode=playerinfo'));
-    if (links.isEmpty) {
-      throw Exception(
-          'No player found for $steam2 on stats.gflclan.com. '
-          'You may not be ranked there yet.');
-    }
-    dom.Element pick = links.first;
-    for (final a in links) {
-      dom.Element? p = a.parent;
-      while (p != null && p.localName != 'tr') {
-        p = p.parent;
-      }
-      if (p != null && p.text.toLowerCase().contains('zombie')) {
-        pick = a;
-        break;
-      }
-    }
-    url = url.resolve(pick.attributes['href']!.replaceAll('&amp;', '&'));
-    res = await _get(url);
-    doc = html_parser.parse(res.body);
-  }
+  final rank = RegExp(r'Ranked (\S+) of ([\d,]+) players').firstMatch(desc);
+  final best =
+      RegExp(r'Best map rank: (\S+) on (.+?)\.\s*(?:Last seen|$)').firstMatch(desc);
+  final seen = RegExp(r'Last seen (.+?)\.?$').firstMatch(desc);
 
   final title = clean(doc.querySelector('title')?.text ?? '');
-  final name = title.contains(' - ') ? title.split(' - ').last : 'PLAYER';
+  final name = title.contains(' | ') ? title.split(' | ').first : 'PLAYER';
+
+  final bodyText = doc.body?.text ?? '';
+  final yr = RegExp(r'Total Play Time\s*([\d,\.]+)\s*hrs\s*in\s*(\d{4})')
+      .firstMatch(bodyText);
 
   return PlayerStats(
-    name,
-    url.toString(),
-    readSummary(doc),
-    findTable(doc, 'weapon'),
-    findTable(doc, 'map'),
-    findTable(doc, 'action'),
+    name: name,
+    id64: id64,
+    url: url,
+    hours: hm.group(1)!,
+    servers: hm.group(2)!,
+    communityCount: hm.group(3)!,
+    rank: rank?.group(1) ?? '-',
+    totalPlayers: rank?.group(2) ?? '-',
+    bestMapRank: best?.group(1) ?? '-',
+    bestMap: best?.group(2) ?? '-',
+    lastSeen: seen?.group(1) ?? '-',
+    yearHours: yr?.group(1) ?? '-',
+    year: yr?.group(2) ?? '',
+    communities: readCommunities(doc),
   );
+}
+
+Future<PlayerStats> fetchStats(String input) async {
+  final id = toSteam64(input);
+  final url = '$kSite/players/$id/profile';
+  http.Response res;
+  try {
+    res = await http.get(Uri.parse(url), headers: {
+      'User-Agent': 'Mozilla/5.0 (Android) GFLZEStats/2.0',
+    }).timeout(const Duration(seconds: 20));
+  } catch (e) {
+    final msg = e.toString();
+    if (msg.contains('SocketFailed') ||
+        msg.contains('SocketException') ||
+        msg.contains('ClientException') ||
+        msg.contains('TimeoutException')) {
+      throw Exception(
+          'Cannot reach zegraph.xyz. Check that your phone has internet.');
+    }
+    rethrow;
+  }
+  if (res.statusCode == 404) throw NotTrackedException();
+  if (res.statusCode != 200) {
+    throw Exception('ZE Graph returned error ${res.statusCode}. Try again later.');
+  }
+  return parseProfile(res.body, id, url);
 }
 
 // -------------------------------------------------------------------- UI ----
@@ -248,7 +223,7 @@ class _StatsPageState extends State<StatsPage> {
   bool _loading = false;
   String? _err;
   int _tab = 0;
-  static const _tabs = ['STATS', 'GUNS', 'MAPS', 'ACTIONS'];
+  static const _tabs = ['STATS', 'COMMUNITIES', 'MORE'];
 
   @override
   void initState() {
@@ -290,6 +265,22 @@ class _StatsPageState extends State<StatsPage> {
     }
   }
 
+  Future<void> _openProfile() async {
+    final url = _stats?.url;
+    if (url == null) return;
+    var opened = false;
+    try {
+      opened = await launchUrl(Uri.parse(url),
+          mode: LaunchMode.externalApplication);
+    } catch (_) {}
+    if (!opened) {
+      await Clipboard.setData(ClipboardData(text: url));
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+          content: Text('Could not open browser. Link copied instead.')));
+    }
+  }
+
   TextStyle _t(double size, {Color color = kGreen, bool bold = false}) =>
       TextStyle(
           fontFamily: kFont,
@@ -308,7 +299,8 @@ class _StatsPageState extends State<StatsPage> {
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               Text('> GFL_ZE_STATS', style: _t(20, bold: true)),
-              Text('// zombie escape player tracker', style: _t(11, color: kDim)),
+              Text('// zombie escape tracker  [data: zegraph.xyz]',
+                  style: _t(11, color: kDim)),
               const SizedBox(height: 10),
               Row(children: [
                 Expanded(
@@ -372,7 +364,9 @@ class _StatsPageState extends State<StatsPage> {
                 Expanded(
                   child: Center(
                     child: Text(
-                        _loading ? 'connecting to stats.gflclan.com...' : 'enter your steam id and scan',
+                        _loading
+                            ? 'connecting to zegraph.xyz...'
+                            : 'enter your steam id and scan',
                         style: _t(12, color: kDim)),
                   ),
                 ),
@@ -388,70 +382,32 @@ class _StatsPageState extends State<StatsPage> {
       case 0:
         return _overview(s);
       case 1:
-        return _guns(s);
-      case 2:
-        return _maps(s);
+        return _communities(s);
       default:
-        return _actions(s);
+        return _more(s);
     }
-  }
-
-  // Fixed-size table: shows as many rows as fit, no scrolling.
-  Widget _grid(List<String> titles, List<int> flex, List<List<String>> rows,
-      {int yellowCol = -1, String empty = 'no data on this page'}) {
-    if (rows.isEmpty) {
-      return Text('// $empty', style: _t(12, color: kDim));
-    }
-    return LayoutBuilder(builder: (context, c) {
-      const rowH = 26.0;
-      final max = ((c.maxHeight - rowH) / rowH).floor().clamp(1, 60);
-      Widget line(List<String> cells, {bool head = false}) => SizedBox(
-            height: rowH,
-            child: Row(children: [
-              for (int i = 0; i < cells.length; i++)
-                Expanded(
-                  flex: flex[i],
-                  child: Text(
-                    cells[i],
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    textAlign: i == 0 ? TextAlign.left : TextAlign.right,
-                    style: head
-                        ? _t(11, color: kDim, bold: true)
-                        : _t(12, color: i == yellowCol ? kYellow : kGreen),
-                  ),
-                ),
-            ]),
-          );
-      return Column(children: [
-        line(titles, head: true),
-        for (final r in rows.take(max)) line(r),
-      ]);
-    });
   }
 
   Widget _overview(PlayerStats s) {
-    final rounds = s.roundsWon;
     final pairs = <List<String>>[
-      ['ZOMBIES KILLED', s.s('Kills:')],
-      ['DEATHS', s.s('Deaths:')],
-      ['K/D', s.s('Kills per Death:')],
-      ['HEADSHOTS', s.s('Headshots:')],
-      ['ROUNDS WON', rounds?.toString() ?? 'not tracked'],
-      ['POINTS', s.s('Points:')],
-      ['RANK', s.s('Rank:')],
-      ['KILL STREAK', s.s('Longest Kill Streak:')],
-      ['SUICIDES', s.s('Suicides:')],
-      ['PLAY TIME', s.s('Total Connection Time:')],
-      ['FAV GUN', s.s('Favorite Weapon:')],
-      ['FAV MAP', s.s('Favorite Map:')],
+      ['TOTAL PLAYTIME', '${s.hours} hrs'],
+      [
+        s.year.isEmpty ? 'THIS YEAR' : 'IN ${s.year}',
+        s.yearHours == '-' ? '-' : '${s.yearHours} hrs'
+      ],
+      ['GLOBAL RANK', '${s.rank} of ${s.totalPlayers}'],
+      ['BEST MAP RANK', s.bestMapRank],
+      ['BEST MAP', s.bestMap],
+      ['LAST SEEN', s.lastSeen],
+      ['SERVERS', s.servers],
+      ['COMMUNITIES', s.communityCount],
     ];
     return LayoutBuilder(builder: (context, c) {
-      final max = (c.maxHeight / 28).floor().clamp(1, 40);
+      final max = (c.maxHeight / 30).floor().clamp(1, 40);
       return Column(children: [
         for (final p in pairs.take(max))
           SizedBox(
-            height: 28,
+            height: 30,
             child: Row(children: [
               Text(p[0], style: _t(12, color: kDim)),
               const SizedBox(width: 8),
@@ -462,7 +418,8 @@ class _StatsPageState extends State<StatsPage> {
                   overflow: TextOverflow.ellipsis,
                   textAlign: TextAlign.right,
                   style: _t(14,
-                      color: p[0] == 'FAV MAP' ? kYellow : kGreen, bold: true),
+                      color: p[0] == 'BEST MAP' ? kYellow : kGreen,
+                      bold: true),
                 ),
               ),
             ]),
@@ -471,42 +428,59 @@ class _StatsPageState extends State<StatsPage> {
     });
   }
 
-  Widget _guns(PlayerStats s) {
-    final t = s.weapons;
-    if (t == null) return _grid([], [], []);
-    final rows = t.rows
-        .map((r) => [t.col(r, 'weapon'), t.col(r, 'kills'), t.col(r, 'headshots')])
-        .toList()
-      ..sort((a, b) => num_(b[1]).compareTo(num_(a[1])));
-    return _grid(['GUN', 'KILLS', 'HS'], [5, 2, 2], rows);
-  }
-
-  Widget _maps(PlayerStats s) {
-    final t = s.maps;
-    if (t == null) return _grid([], [], []);
-    final rows = t.rows
-        .map((r) => [
-              t.col(r, 'map'),
-              t.col(r, 'kills'),
-              t.col(r, 'deaths'),
-              t.col(r, 'k:d'),
-            ])
-        .toList()
-      ..sort((a, b) => num_(b[1]).compareTo(num_(a[1])));
-    return _grid(['MAP', 'KILLS', 'DEATHS', 'K:D'], [6, 2, 2, 2], rows,
-        yellowCol: 0);
-  }
-
-  Widget _actions(PlayerStats s) {
-    final t = s.actions;
-    if (t == null) {
-      return _grid([], [], [],
-          empty: 'no actions listed (round wins may not be tracked)');
+  Widget _communities(PlayerStats s) {
+    if (s.communities.isEmpty) {
+      return Text('// no community list found on the page. Open the full profile in MORE.',
+          style: _t(12, color: kDim));
     }
-    final rows = t.rows
-        .map((r) => [t.col(r, 'action'), t.col(r, 'earned'), t.col(r, 'points')])
-        .toList()
-      ..sort((a, b) => num_(b[1]).compareTo(num_(a[1])));
-    return _grid(['ACTION', 'COUNT', 'POINTS'], [5, 2, 2], rows);
+    return LayoutBuilder(builder: (context, c) {
+      const rowH = 28.0;
+      final max = (c.maxHeight / rowH).floor().clamp(1, 40);
+      return Column(children: [
+        for (final co in s.communities.take(max))
+          SizedBox(
+            height: rowH,
+            child: Row(children: [
+              Expanded(
+                child: Text(co.name,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: _t(13)),
+              ),
+              Text('${co.hours} hrs', style: _t(13, bold: true)),
+            ]),
+          ),
+      ]);
+    });
+  }
+
+  Widget _more(PlayerStats s) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text('STEAM ID', style: _t(11, color: kDim)),
+        Text(s.id64, style: _t(14, bold: true)),
+        const SizedBox(height: 14),
+        Text('// on the website only:', style: _t(12, color: kDim)),
+        Text('per-map playtime, play sessions,\nactivity heatmap, map rankings',
+            style: _t(12)),
+        const SizedBox(height: 14),
+        Text('// not tracked by ZE Graph:', style: _t(12, color: kDim)),
+        Text('guns, kills, boss kills, boss damage,\nround wins, map wins',
+            style: _t(12, color: kRed)),
+        const SizedBox(height: 18),
+        SizedBox(
+          width: double.infinity,
+          child: OutlinedButton(
+            onPressed: _openProfile,
+            style: OutlinedButton.styleFrom(
+                side: const BorderSide(color: kGreen),
+                shape: const RoundedRectangleBorder(),
+                padding: const EdgeInsets.symmetric(vertical: 12)),
+            child: Text('OPEN FULL PROFILE', style: _t(13, bold: true)),
+          ),
+        ),
+      ],
+    );
   }
 }
